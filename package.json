@@ -10,6 +10,9 @@
   "engines": {
     "node": ">=18"
   },
+  "bin": {
+    "proviras-log": "dist/cli.js"
+  },
   "scripts": {
     "build": "tsc"
   },

@@ -2,31 +2,76 @@
 
 Track agent activity and post daily logs to [Proviras](https://proviras.com).
 
-## Install
+## Claude Code setup
+
+**1. Install**
 
 ```sh
-npm install proviras-sdk
+npm install -g proviras-sdk
 ```
 
-## Quick start
+**2. Set environment variables**
+
+```sh
+export PROVIRAS_PARENT_ID=<your-proviras-user-id>
+export PROVIRAS_PLATFORM=claude-code
+```
+
+**3. Add `CLAUDE.md` to your project** (or `~/.claude/CLAUDE.md` for all projects)
+
+Copy [CLAUDE.md](./CLAUDE.md) from this repo. It tells Claude to summarize its work and call `proviras-log` at the end of every session.
+
+That's it. Claude will automatically post a log when each session ends.
+
+---
+
+## How it works
+
+At the end of a session, Claude runs:
+
+```sh
+proviras-log '[{"title":"...","category":"code","outcome":"completed","summary":"...","model":"claude-sonnet-4-6","skillsUsed":[],"durationEstimate":10}]'
+```
+
+The CLI registers your agent on first run (saving an `agentId` to `~/.proviras/config.json`), then posts the log to `https://proviras.com/api/agent/log`.
+
+### Task fields
+
+| field | values |
+|-------|--------|
+| `category` | `email` \| `calendar` \| `file` \| `web` \| `code` \| `other` |
+| `outcome` | `completed` \| `failed` \| `partial` |
+| `skillsUsed` | slash commands used, e.g. `["review"]`; `[]` if none |
+| `durationEstimate` | estimated minutes; omit if unknown |
+
+### Environment variables
+
+| variable | required | description |
+|----------|----------|-------------|
+| `PROVIRAS_PARENT_ID` | yes | your Proviras user ID |
+| `PROVIRAS_PLATFORM` | yes | runtime platform (`claude-code`, `cursor`, etc.) |
+| `PROVIRAS_USER_ID` | no | injected by a parent agent when you are spawned |
+
+---
+
+## Custom Node.js agents
+
+If you're building your own agent (not Claude Code), import the SDK directly and use the `Session` API. Traces collected within the session are attached to tasks automatically.
 
 ```ts
-import { ProvirasSdk, Task } from "proviras-sdk";
+import { ProvirasSdk } from "proviras-sdk";
 
 const sdk = new ProvirasSdk();
-// reads PROVIRAS_PARENT_ID, PROVIRAS_USER_ID, PROVIRAS_PLATFORM from env
-
-const session = sdk.startSession(); // period starts at midnight UTC today
+const session = sdk.startSession(); // defaults to start of today UTC
                                     // auto-flushes on process exit
 
-// instrument functions to capture traces automatically
+// wrap functions to capture traces automatically
 const readFile = session.wrapTool(async (p: string) => fs.readFile(p, "utf8"));
 const generate = session.wrapLlm(async (prompt: string) => llm.call(prompt));
 
-const content = await readFile("report.md");
-const result  = await generate(content);
+await readFile("report.md");
+await generate(prompt);
 
-// record a completed task — loose traces attach automatically
 session.addTask({
   title: "Generate report",
   category: "code",
@@ -36,55 +81,29 @@ session.addTask({
   skillsUsed: [],
 });
 
-// or end the session explicitly
-await session.end();
+await session.end(); // or let process exit handle it
 ```
 
-## Session lifecycle
+### Session lifecycle
 
-`startSession()` mirrors how AgentOps closes traces:
-
-- **`beforeExit`** — flushes when the Node.js event loop drains naturally
+- **`beforeExit`** — flushes when the Node.js event loop drains
 - **`SIGINT` / `SIGTERM`** — flushes then exits cleanly
-- **`session.end()`** — explicit flush; idempotent, safe to call multiple times
-- **context not supported** — unlike Python's `with`, JS has no sync context manager; call `await session.end()` before any explicit `process.exit()`
-
-## Tracing
-
-### Wrap existing functions
-
-```ts
-// tool_call trace
-const myTool = session.wrapTool(myFn);
-
-// llm_call trace
-const myLlm = session.wrapLlm(myFn);
-```
+- **`session.end()`** — explicit flush; idempotent
+- Call `await session.end()` before any explicit `process.exit()`
 
 ### Manual traces
 
 ```ts
-const builder = session.startTrace("my-step", "action");
-builder.setInput("...");
-const result = doWork();
-builder.setOutput(result);
-builder.finish(); // records endedAt + durationMs
-```
-
-### Attach traces to a task
-
-Finished traces accumulate as "loose traces" and are swept onto the next `addTask()` call automatically. To attach them manually:
-
-```ts
-const t = session.startTrace("llm-call", "llm_call");
-const out = await llm.call(prompt);
-t.setOutput(out);
+const t = session.startTrace("my-step", "llm_call");
+t.setInput(prompt);
+const result = await llm.call(prompt);
+t.setOutput(result);
 t.finish();
 
 session.addTask({ ..., traces: [t.trace] });
 ```
 
-## Trace types
+### Trace types
 
 | type | when to use |
 |------|-------------|
@@ -92,20 +111,3 @@ session.addTask({ ..., traces: [t.trace] });
 | `tool_call` | tool or function invocation |
 | `action` | any other agent action |
 | `error` | unrecoverable error within a task |
-
-## Environment variables
-
-| variable | required | description |
-|----------|----------|-------------|
-| `PROVIRAS_PARENT_ID` | yes | overarching human user's ID |
-| `PROVIRAS_PLATFORM` | yes | runtime platform (`openclaw`, `claude`, `cursor`, etc.) |
-| `PROVIRAS_USER_ID` | no | owner agent's ID — injected by a parent agent at spawn time |
-
-Registration happens automatically on first `session.end()`. The `agentId` is persisted to `~/.proviras/config.json`.
-
-## Low-level API
-
-```ts
-// skip Session and post directly
-await sdk.log(tasks, periodStart, periodEnd);
-```
