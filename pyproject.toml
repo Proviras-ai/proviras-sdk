@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "proviras-sdk"
+version = "1.0.0"
+description = "Proviras analytics SDK for OpenClaw agents"
+requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://proviras.com"
