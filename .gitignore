@@ -1,10 +1,4 @@
 node_modules/
 dist/
 
-# Python build artifacts
-__pycache__/
-*.pyc
-*.egg-info/
-build/
-
 .DS_Store
