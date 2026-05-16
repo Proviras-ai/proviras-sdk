@@ -1,206 +1,243 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { randomUUID } from "crypto";
+import { BaseTracer, type Run } from "@langchain/core/tracers/base";
 
-export type TraceType = "llm_call" | "tool_call" | "action" | "error";
+export type Surface = "cowork" | "chat" | "code" | "api";
 
-export interface Trace {
-  type: TraceType;
-  name: string;
-  startedAt: Date;
-  endedAt?: Date;
-  input?: string;
-  output?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
+export interface TokenUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
 }
 
-export interface Task {
-  title: string;
-  category: "email" | "calendar" | "file" | "web" | "code" | "other";
-  outcome: "completed" | "failed" | "partial";
-  summary: string;
-  model: string;
-  skillsUsed?: string[];
-  durationEstimate?: number;
-  costEstimate?: string;
-  traces?: Trace[];
+export interface ProvirasTracerOptions {
+  sdk: ProvirasSdk;
+  taskDescription: string;
+  surface?: Surface;
 }
 
-function serializeTrace(t: Trace): Record<string, unknown> {
-  const out: Record<string, unknown> = {
-    type: t.type,
-    name: t.name,
-    startedAt: t.startedAt.toISOString(),
-  };
-  if (t.endedAt) {
-    out.endedAt = t.endedAt.toISOString();
-    out.durationMs = t.endedAt.getTime() - t.startedAt.getTime();
-  }
-  if (t.input !== undefined) out.input = t.input;
-  if (t.output !== undefined) out.output = t.output;
-  if (t.error !== undefined) out.error = t.error;
-  if (t.metadata && Object.keys(t.metadata).length > 0) out.metadata = t.metadata;
-  return out;
-}
+// LangChain Run.run_type can be any string; the server only accepts these four.
+const SERVER_RUN_TYPES = new Set(["llm", "tool", "chain", "retriever"]);
 
-export class TraceBuilder {
-  private readonly _trace: Trace;
-
-  constructor(name: string, type: TraceType) {
-    this._trace = { type, name, startedAt: new Date() };
-  }
-
-  setInput(value: string): this {
-    this._trace.input = value;
-    return this;
-  }
-
-  setOutput(value: string): this {
-    this._trace.output = value;
-    return this;
-  }
-
-  setMetadata(metadata: Record<string, unknown>): this {
-    this._trace.metadata = { ...this._trace.metadata, ...metadata };
-    return this;
-  }
-
-  finish(error?: string): Trace {
-    this._trace.endedAt = new Date();
-    if (error !== undefined) this._trace.error = error;
-    return this._trace;
-  }
-
-  get trace(): Trace {
-    return this._trace;
-  }
-}
+const MAX_FIELD_LEN = 8000;
 
 /**
- * Collects tasks and traces for a time period and posts the log when the
- * session ends — explicitly via end(), or automatically on process exit
- * (beforeExit / SIGINT / SIGTERM), mirroring how AgentOps closes traces.
+ * LangChain/LangGraph callback handler that streams traces to Proviras.
  *
- * Usage (context-style):
- *   const session = sdk.startSession();
- *   session.addTask({ ... });
- *   await session.end();
+ * Usage:
+ *   const sdk = new ProvirasSdk();
+ *   const tracer = await sdk.trace("Answer user question");
+ *   await graph.invoke({ input }, { callbacks: [tracer] });
  *
- * Usage (auto-flush on exit):
- *   const session = sdk.startSession();
- *   // process.beforeExit will call end() automatically
+ * The session is created upfront via POST /api/agent/session. Each LangChain
+ * run that completes becomes a TraceCall via POST /api/agent/session/{id}/trace.
+ * When the root run ends, the session is finalized via PATCH /api/agent/session/{id}.
+ *
+ * Traces are posted in tree order at the end of the root run (not streamed),
+ * so parent traceIds (server-issued) are always available before child traces
+ * reference them.
  */
-export class Session {
-  readonly periodStart: Date;
-  private readonly _sdk: ProvirasSdk;
-  private readonly _tasks: Task[] = [];
-  private readonly _looseTraces: Trace[] = [];
-  private _ended = false;
+export class ProvirasTracer extends BaseTracer {
+  name = "proviras_tracer";
 
-  constructor(sdk: ProvirasSdk, periodStart: Date) {
-    this._sdk = sdk;
-    this.periodStart = periodStart;
+  readonly sessionId: string;
+  private readonly sdk: ProvirasSdk;
+  private readonly taskDescription: string;
+  private readonly surface: Surface;
+  private readonly startedAt: Date;
+  private readonly traceIdMap: Map<string, string> = new Map();
+  private readonly totals: Required<TokenUsage> = {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  };
+  private sessionReady: Promise<void> | null = null;
+  private finalized = false;
 
-    // Mirror AgentOps' atexit pattern — flush when the event loop drains
-    // naturally. For explicit process.exit() callers, end() should be awaited
-    // before exiting.
-    const flush = () => { void this.end(); };
-    process.once("beforeExit", flush);
-    process.once("SIGINT", () => { void this.end().then(() => process.exit(0)); });
-    process.once("SIGTERM", () => { void this.end().then(() => process.exit(0)); });
+  static async create(options: ProvirasTracerOptions): Promise<ProvirasTracer> {
+    const tracer = new ProvirasTracer(options);
+    await tracer.ensureSession();
+    return tracer;
   }
 
-  // ── task management ────────────────────────────────────────────────────────
+  constructor(options: ProvirasTracerOptions) {
+    super();
+    this.sdk = options.sdk;
+    this.taskDescription = options.taskDescription;
+    this.surface = options.surface ?? "api";
+    this.sessionId = randomUUID();
+    this.startedAt = new Date();
+  }
 
-  addTask(task: Task): void {
-    const finished = this._looseTraces.filter((t) => t.endedAt !== undefined);
-    this._looseTraces.splice(
+  private ensureSession(): Promise<void> {
+    if (!this.sessionReady) this.sessionReady = this.createSession();
+    return this.sessionReady;
+  }
+
+  private async createSession(): Promise<void> {
+    const agentId = await this.sdk.register();
+    await this.sdk.request("POST", "/agent/session", {
+      sessionId: this.sessionId,
+      agentId,
+      taskDescription: this.taskDescription,
+      startedAt: this.startedAt.toISOString(),
+      status: "running",
+      surface: this.surface,
+    }, { "X-Agent-ID": agentId });
+  }
+
+  protected async persistRun(run: Run): Promise<void> {
+    // Called by BaseTracer only when the root run ends. Walk the tree and
+    // post each run in preorder so parents are posted before children.
+    await this.ensureSession();
+    await this.postRunTree(run);
+    await this.finalizeSession(run);
+  }
+
+  private async postRunTree(run: Run): Promise<void> {
+    await this.postRun(run);
+    for (const child of run.child_runs ?? []) {
+      await this.postRunTree(child);
+    }
+  }
+
+  private async postRun(run: Run): Promise<void> {
+    if (!SERVER_RUN_TYPES.has(run.run_type)) return;
+
+    const endTime = run.end_time ?? Date.now();
+    const latencyMs = Math.max(0, endTime - run.start_time);
+    const parentTraceId = run.parent_run_id
+      ? this.traceIdMap.get(run.parent_run_id)
+      : undefined;
+
+    const tokens = this.extractTokens(run);
+    if (tokens) this.accumulateTokens(tokens);
+
+    const payload: Record<string, unknown> = {
+      runType: run.run_type,
+      stepId: run.id,
+      timestamp: new Date(run.start_time).toISOString(),
+      latencyMs,
+    };
+    if (parentTraceId) payload.parentTraceId = parentTraceId;
+    const model = this.extractModel(run);
+    if (model) payload.model = model;
+    const input = this.stringify(run.inputs);
+    if (input) payload.input = input;
+    const output = this.stringify(run.outputs);
+    if (output) payload.output = output;
+    if (tokens) payload.tokens = tokens;
+    if (run.error) payload.error = String(run.error);
+
+    try {
+      const agentId = this.sdk.agentId;
+      const response = await this.sdk.request(
+        "POST",
+        `/agent/session/${this.sessionId}/trace`,
+        payload,
+        agentId ? { "X-Agent-ID": agentId } : undefined,
+      );
+      const traceId = response?.traceId;
+      if (typeof traceId === "string") this.traceIdMap.set(run.id, traceId);
+    } catch {
+      // never break the graph because telemetry failed
+    }
+  }
+
+  private async finalizeSession(rootRun: Run): Promise<void> {
+    if (this.finalized) return;
+    this.finalized = true;
+
+    const completedAt = new Date();
+    const totalLatencyMs = Math.max(
       0,
-      this._looseTraces.length,
-      ...this._looseTraces.filter((t) => t.endedAt === undefined)
+      (rootRun.end_time ?? completedAt.getTime()) - rootRun.start_time,
     );
-    this._tasks.push({ ...task, traces: [...(task.traces ?? []), ...finished] });
+
+    try {
+      const agentId = this.sdk.agentId;
+      await this.sdk.request(
+        "PATCH",
+        `/agent/session/${this.sessionId}`,
+        {
+          sessionId: this.sessionId,
+          status: rootRun.error ? "failed" : "completed",
+          completedAt: completedAt.toISOString(),
+          totalTokens: this.totals,
+          totalLatencyMs,
+        },
+        agentId ? { "X-Agent-ID": agentId } : undefined,
+      );
+    } catch {
+      // swallow
+    }
   }
 
-  // ── trace helpers ──────────────────────────────────────────────────────────
-
-  startTrace(name: string, type: TraceType = "action"): TraceBuilder {
-    const builder = new TraceBuilder(name, type);
-    this._looseTraces.push(builder.trace);
-    return builder;
+  private accumulateTokens(tokens: TokenUsage): void {
+    if (tokens.promptTokens) this.totals.promptTokens += tokens.promptTokens;
+    if (tokens.completionTokens) this.totals.completionTokens += tokens.completionTokens;
+    if (tokens.totalTokens) this.totals.totalTokens += tokens.totalTokens;
   }
 
-  /**
-   * Wrap a sync or async function as a tool_call trace.
-   *
-   *   const readFile = session.wrapTool(async (p: string) => fs.readFile(p));
-   */
-  wrapTool<Args extends unknown[], R>(
-    fn: (...args: Args) => R,
-    name?: string
-  ): (...args: Args) => R {
-    const traceName = name ?? fn.name ?? "tool";
-    return (...args: Args): R => {
-      const builder = this.startTrace(traceName, "tool_call");
-      builder.setInput(JSON.stringify(args).slice(0, 500));
-      let result: R;
-      try {
-        result = fn(...args);
-      } catch (err) {
-        builder.finish(String(err));
-        throw err;
-      }
-      if (result instanceof Promise) {
-        return result.then(
-          (r) => { builder.setOutput(JSON.stringify(r).slice(0, 500)); builder.finish(); return r; },
-          (err) => { builder.finish(String(err)); throw err; }
-        ) as unknown as R;
-      }
-      builder.setOutput(JSON.stringify(result).slice(0, 500));
-      builder.finish();
-      return result;
-    };
+  private extractModel(run: Run): string | undefined {
+    const metadata = (run.extra?.metadata ?? {}) as Record<string, unknown>;
+    if (typeof metadata.ls_model_name === "string") return metadata.ls_model_name;
+    const invocation = (run.extra?.invocation_params ?? {}) as Record<string, unknown>;
+    if (typeof invocation.model === "string") return invocation.model;
+    if (typeof invocation.model_name === "string") return invocation.model_name;
+    const serialized = ((run.serialized ?? {}) as Record<string, unknown>);
+    const kwargs = (serialized.kwargs ?? {}) as Record<string, unknown>;
+    if (typeof kwargs.model === "string") return kwargs.model;
+    if (typeof kwargs.model_name === "string") return kwargs.model_name;
+    return undefined;
   }
 
-  /**
-   * Wrap a sync or async function as an llm_call trace.
-   *
-   *   const generate = session.wrapLlm(async (prompt: string) => llm.call(prompt));
-   */
-  wrapLlm<Args extends unknown[], R>(
-    fn: (...args: Args) => R,
-    name?: string
-  ): (...args: Args) => R {
-    const traceName = name ?? fn.name ?? "llm";
-    return (...args: Args): R => {
-      const builder = this.startTrace(traceName, "llm_call");
-      let result: R;
-      try {
-        result = fn(...args);
-      } catch (err) {
-        builder.finish(String(err));
-        throw err;
-      }
-      if (result instanceof Promise) {
-        return result.then(
-          (r) => { builder.setOutput(JSON.stringify(r).slice(0, 500)); builder.finish(); return r; },
-          (err) => { builder.finish(String(err)); throw err; }
-        ) as unknown as R;
-      }
-      builder.setOutput(JSON.stringify(result).slice(0, 500));
-      builder.finish();
-      return result;
-    };
+  private extractTokens(run: Run): TokenUsage | undefined {
+    if (run.run_type !== "llm") return undefined;
+    const outputs = (run.outputs ?? {}) as Record<string, unknown>;
+    const candidates: Array<Record<string, unknown> | undefined> = [
+      outputs.llmOutput as Record<string, unknown> | undefined,
+      (outputs.llmOutput as Record<string, unknown> | undefined)?.tokenUsage as
+        | Record<string, unknown>
+        | undefined,
+      (outputs.llmOutput as Record<string, unknown> | undefined)?.usage_metadata as
+        | Record<string, unknown>
+        | undefined,
+      outputs.usage_metadata as Record<string, unknown> | undefined,
+    ];
+    for (const c of candidates) {
+      if (!c) continue;
+      const usage = this.readUsage(c);
+      if (usage) return usage;
+    }
+    return undefined;
   }
 
-  // ── lifecycle ──────────────────────────────────────────────────────────────
+  private readUsage(src: Record<string, unknown>): TokenUsage | undefined {
+    const prompt = src.promptTokens ?? src.prompt_tokens ?? src.input_tokens;
+    const completion =
+      src.completionTokens ?? src.completion_tokens ?? src.output_tokens;
+    const total = src.totalTokens ?? src.total_tokens;
+    const usage: TokenUsage = {};
+    if (typeof prompt === "number") usage.promptTokens = prompt;
+    if (typeof completion === "number") usage.completionTokens = completion;
+    if (typeof total === "number") usage.totalTokens = total;
+    return Object.keys(usage).length > 0 ? usage : undefined;
+  }
 
-  /** Post the session log. Idempotent — safe to call multiple times. */
-  async end(periodEnd?: Date): Promise<boolean> {
-    if (this._ended) return true;
-    this._ended = true;
-    return this._sdk.log(this._tasks, this.periodStart, periodEnd);
+  private stringify(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    try {
+      const str = typeof value === "string" ? value : JSON.stringify(value);
+      if (!str) return undefined;
+      return str.length > MAX_FIELD_LEN
+        ? str.slice(0, MAX_FIELD_LEN) + "...[truncated]"
+        : str;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -245,9 +282,11 @@ export class ProvirasSdk {
     };
     if (this.userId) payload.parentAgentId = this.userId;
 
-    const response = await this.post("/agent/register", payload);
-    const agentId = response.agentId as string;
-    if (!agentId) throw new Error(`Registration failed: ${JSON.stringify(response)}`);
+    const response = await this.request("POST", "/agent/register", payload);
+    const agentId = response?.agentId;
+    if (typeof agentId !== "string") {
+      throw new Error(`Registration failed: ${JSON.stringify(response)}`);
+    }
 
     this._agentId = agentId;
     this.saveConfig({ agentId });
@@ -255,70 +294,35 @@ export class ProvirasSdk {
   }
 
   /**
-   * Start a new session. Defaults to the start of today (UTC).
-   * The session auto-flushes via beforeExit / SIGINT / SIGTERM.
+   * Create a session-scoped tracer that can be passed to LangGraph as a callback.
    *
-   *   const session = sdk.startSession();
-   *   session.addTask({ ... });
-   *   await session.end(); // or let process exit handle it
+   *   const tracer = await sdk.trace("Answer user question");
+   *   await graph.invoke(input, { callbacks: [tracer] });
    */
-  startSession(periodStart?: Date): Session {
-    const start = periodStart ?? (() => {
-      const now = new Date();
-      return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-    })();
-    return new Session(this, start);
-  }
-
-  /** Low-level: post a log directly. Prefer startSession() for new code. */
-  async log(tasks: Task[], periodStart: Date, periodEnd?: Date): Promise<boolean> {
-    const agentId = await this.register();
-    const now = periodEnd ?? new Date();
-
-    const serialized = tasks.map((t) => {
-      const entry: Record<string, unknown> = {
-        title: t.title,
-        category: t.category,
-        outcome: t.outcome,
-        summary: t.summary,
-        model: t.model,
-        skillsUsed: t.skillsUsed ?? [],
-      };
-      if (t.durationEstimate !== undefined) entry.durationEstimate = t.durationEstimate;
-      if (t.costEstimate !== undefined) entry.costEstimate = t.costEstimate;
-      if (t.traces && t.traces.length > 0) entry.traces = t.traces.map(serializeTrace);
-      return entry;
+  trace(
+    taskDescription: string,
+    options?: { surface?: Surface },
+  ): Promise<ProvirasTracer> {
+    return ProvirasTracer.create({
+      sdk: this,
+      taskDescription,
+      surface: options?.surface,
     });
-
-    const payload = {
-      agentId,
-      loggedAt: now.toISOString(),
-      periodStart: periodStart.toISOString(),
-      periodEnd: now.toISOString(),
-      tasks: serialized,
-      heartbeatStatus: tasks.length > 0 ? "active" : "idle",
-    };
-
-    try {
-      await this.post("/agent/log", payload, { "X-Agent-ID": agentId });
-      return true;
-    } catch {
-      return false;
-    }
   }
 
-  private async post(
+  async request(
+    method: "POST" | "PATCH",
     endpoint: string,
     payload: unknown,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
   ): Promise<Record<string, unknown>> {
     const response = await fetch(`${ProvirasSdk.BASE_URL}${endpoint}`, {
-      method: "POST",
+      method,
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify(payload),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json() as Promise<Record<string, unknown>>;
+    return (await response.json()) as Record<string, unknown>;
   }
 
   private readAgentName(): string {

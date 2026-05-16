@@ -1,113 +1,91 @@
 # proviras-sdk
 
-Track agent activity and post daily logs to [Proviras](https://proviras.com).
+Trace LangGraph and LangChain runs to [Proviras](https://proviras.com).
 
-## Claude Code setup
+`ProvirasTracer` is a LangChain `BaseTracer` you pass as a callback. It creates one Proviras session per graph invocation and streams each LLM, tool, chain, and retriever run to your dashboard as a `TraceCall`.
 
-**1. Install**
+## Install
 
 ```sh
-npm install -g proviras-sdk
+npm install proviras-sdk @langchain/core
 ```
 
-**2. Set environment variables**
+`@langchain/core` is a peer dependency. Your project already has it if you use LangGraph or LangChain.
+
+## Setup
 
 ```sh
 export PROVIRAS_PARENT_ID=<your-proviras-user-id>
-export PROVIRAS_PLATFORM=claude-code
+export PROVIRAS_PLATFORM=langgraph
 ```
-
-**3. Add `CLAUDE.md` to your project** (or `~/.claude/CLAUDE.md` for all projects)
-
-Copy [CLAUDE.md](./CLAUDE.md) from this repo. It tells Claude to summarize its work and call `proviras-log` at the end of every session.
-
-That's it. Claude will automatically post a log when each session ends.
-
----
-
-## How it works
-
-At the end of a session, Claude runs:
-
-```sh
-proviras-log '[{"title":"...","category":"code","outcome":"completed","summary":"...","model":"claude-sonnet-4-6","skillsUsed":[],"durationEstimate":10}]'
-```
-
-The CLI registers your agent on first run (saving an `agentId` to `~/.proviras/config.json`), then posts the log to `https://proviras.com/api/agent/log`.
-
-### Task fields
-
-| field | values |
-|-------|--------|
-| `category` | `email` \| `calendar` \| `file` \| `web` \| `code` \| `other` |
-| `outcome` | `completed` \| `failed` \| `partial` |
-| `skillsUsed` | slash commands used, e.g. `["review"]`; `[]` if none |
-| `durationEstimate` | estimated minutes; omit if unknown |
-
-### Environment variables
 
 | variable | required | description |
 |----------|----------|-------------|
 | `PROVIRAS_PARENT_ID` | yes | your Proviras user ID |
-| `PROVIRAS_PLATFORM` | yes | runtime platform (`claude-code`, `cursor`, etc.) |
-| `PROVIRAS_USER_ID` | no | injected by a parent agent when you are spawned |
+| `PROVIRAS_PLATFORM` | yes | runtime platform (e.g. `langgraph`, `langchain-js`) |
+| `PROVIRAS_USER_ID` | no | parent agent ID when this agent is spawned by another |
 
----
-
-## Custom Node.js agents
-
-If you're building your own agent (not Claude Code), import the SDK directly and use the `Session` API. Traces collected within the session are attached to tasks automatically.
+## Usage with LangGraph
 
 ```ts
 import { ProvirasSdk } from "proviras-sdk";
+import { StateGraph } from "@langchain/langgraph";
 
 const sdk = new ProvirasSdk();
-const session = sdk.startSession(); // defaults to start of today UTC
-                                    // auto-flushes on process exit
 
-// wrap functions to capture traces automatically
-const readFile = session.wrapTool(async (p: string) => fs.readFile(p, "utf8"));
-const generate = session.wrapLlm(async (prompt: string) => llm.call(prompt));
+const graph = /* build your StateGraph */;
 
-await readFile("report.md");
-await generate(prompt);
+const tracer = await sdk.trace("Answer user question");
 
-session.addTask({
-  title: "Generate report",
-  category: "code",
-  outcome: "completed",
-  summary: "Read report.md and generated a summary.",
-  model: "claude-sonnet-4-6",
-  skillsUsed: [],
-});
-
-await session.end(); // or let process exit handle it
+const result = await graph.invoke(
+  { messages: [{ role: "user", content: "..." }] },
+  { callbacks: [tracer] },
+);
+// session is finalized automatically when the root run ends
 ```
 
-### Session lifecycle
+`sdk.trace(taskDescription)` returns an awaited `ProvirasTracer`. It:
 
-- **`beforeExit`** — flushes when the Node.js event loop drains
-- **`SIGINT` / `SIGTERM`** — flushes then exits cleanly
-- **`session.end()`** — explicit flush; idempotent
-- Call `await session.end()` before any explicit `process.exit()`
+1. Registers your agent on first run (saves `agentId` to `~/.proviras/config.json`)
+2. Creates a session: `POST /api/agent/session`
+3. On each completed LangChain run, posts a trace: `POST /api/agent/session/{id}/trace`
+4. When the root run ends, finalizes the session: `PATCH /api/agent/session/{id}`
 
-### Manual traces
+Telemetry failures are swallowed — they never break the graph.
+
+## What gets captured
+
+For each LangChain `Run` that completes (`run_type` of `llm`, `tool`, `chain`, or `retriever`):
+
+| field | source |
+|-------|--------|
+| `runType` | `run.run_type` |
+| `stepId` | `run.id` |
+| `parentTraceId` | server-issued traceId of the parent run |
+| `timestamp` | `run.start_time` |
+| `latencyMs` | `run.end_time - run.start_time` |
+| `model` | `run.extra.metadata.ls_model_name` (LangChain sets this on LLM runs) |
+| `input` / `output` | stringified `run.inputs` / `run.outputs`, truncated at 8 KB |
+| `tokens` | `run.outputs.llmOutput.tokenUsage` (LLM runs only) |
+| `error` | `run.error` |
+
+Trace posting happens once at root-run completion, in tree preorder, so a child's `parentTraceId` is always set correctly before it's posted.
+
+## Per-invocation surface
 
 ```ts
-const t = session.startTrace("my-step", "llm_call");
-t.setInput(prompt);
-const result = await llm.call(prompt);
-t.setOutput(result);
-t.finish();
-
-session.addTask({ ..., traces: [t.trace] });
+await sdk.trace("nightly summary", { surface: "code" });
 ```
 
-### Trace types
+`surface` is one of `cowork | chat | code | api` and defaults to `api`.
 
-| type | when to use |
-|------|-------------|
-| `llm_call` | call to a language model |
-| `tool_call` | tool or function invocation |
-| `action` | any other agent action |
-| `error` | unrecoverable error within a task |
+## Server contract
+
+The SDK assumes these endpoints exist on the Proviras server:
+
+| method | path | purpose |
+|--------|------|---------|
+| `POST` | `/api/agent/register` | one-time agent registration → `{ agentId }` |
+| `POST` | `/api/agent/session` | create session with `{ sessionId, agentId, taskDescription, startedAt, status, surface }` |
+| `POST` | `/api/agent/session/[sessionId]/trace` | append a `CreateTraceCall` → `{ traceId }` |
+| `PATCH` | `/api/agent/session/[sessionId]` | finalize with `{ status, completedAt, totalTokens, totalLatencyMs }` |
