@@ -88,4 +88,5 @@ The SDK assumes these endpoints exist on the Proviras server:
 | `POST` | `/api/agent/register` | one-time agent registration → `{ agentId }` |
 | `POST` | `/api/agent/session` | create session with `{ sessionId, agentId, taskDescription, startedAt, status, surface }` |
 | `POST` | `/api/agent/session/[sessionId]/trace` | append a `CreateTraceCall` → `{ traceId }` |
-| `PATCH` | `/api/agent/session/[sessionId]` | finalize with `{ status, completedAt, totalTokens, totalLatencyMs }` |
+| `PATCH` | `/api/agent/session/[sessionId]` | mid-session sparse update (all fields optional, status can be `running`) |
+| `PATCH` | `/api/agent/session` | end session — `sessionId` in body, terminal `status` required, server stamps `completedAt` if omitted |

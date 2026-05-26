@@ -160,7 +160,7 @@ export class ProvirasTracer extends BaseTracer {
       const agentId = this.sdk.agentId;
       await this.sdk.request(
         "PATCH",
-        `/agent/session/${this.sessionId}`,
+        "/agent/session",
         {
           sessionId: this.sessionId,
           status: rootRun.error ? "failed" : "completed",
