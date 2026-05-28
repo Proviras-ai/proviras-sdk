@@ -13,6 +13,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify versions match tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          NPM_VERSION=$(awk -F'"' '/"version":/{print $4; exit}' package.json)
+          PY_VERSION=$(awk -F'"' '/^version *= *"/{print $2; exit}' python/pyproject.toml)
+          echo "Tag: $TAG | package.json: $NPM_VERSION | pyproject.toml: $PY_VERSION"
+          fail=0
+          if [ "$TAG" != "$NPM_VERSION" ]; then
+            echo "::error::package.json version ($NPM_VERSION) does not match tag (v$TAG)"
+            fail=1
+          fi
+          if [ "$TAG" != "$PY_VERSION" ]; then
+            echo "::error::python/pyproject.toml version ($PY_VERSION) does not match tag (v$TAG)"
+            fail=1
+          fi
+          exit $fail
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
