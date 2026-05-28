@@ -1,6 +1,6 @@
 {
   "name": "proviras-sdk",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Proviras tracing SDK for LangGraph and LangChain agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
