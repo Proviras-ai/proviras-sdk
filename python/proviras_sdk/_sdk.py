@@ -22,7 +22,7 @@ class ProvirasSdk:
     don't re-register.
     """
 
-    BASE_URL = "https://proviras.com/api"
+    BASE_URL = "https://www.proviras.com/api"
 
     def __init__(self, config_path: Optional[Path] = None) -> None:
         self._parent_id = os.environ.get("PROVIRAS_PARENT_ID")

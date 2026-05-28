@@ -242,7 +242,7 @@ export class ProvirasTracer extends BaseTracer {
 }
 
 export class ProvirasSdk {
-  private static readonly BASE_URL = "https://proviras.com/api";
+  private static readonly BASE_URL = "https://www.proviras.com/api";
 
   private readonly parentId: string | undefined;
   private readonly userId: string | undefined;
