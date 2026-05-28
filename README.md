@@ -4,6 +4,8 @@ Trace LangGraph and LangChain runs to [Proviras](https://proviras.com).
 
 `ProvirasTracer` is a LangChain `BaseTracer` you pass as a callback. It creates one Proviras session per graph invocation and streams each LLM, tool, chain, and retriever run to your dashboard as a `TraceCall`.
 
+> **Python users:** the same SDK is available for Python — see [`python/`](./python/README.md) (PyPI: `proviras-sdk`).
+
 ## Install
 
 ```sh
