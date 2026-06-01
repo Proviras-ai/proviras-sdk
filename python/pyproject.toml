@@ -1,6 +1,6 @@
 [project]
 name = "proviras-sdk"
-version = "2.1.2"
+version = "2.1.4"
 description = "Proviras tracing SDK for LangGraph and LangChain agents"
 readme = "README.md"
 requires-python = ">=3.9"

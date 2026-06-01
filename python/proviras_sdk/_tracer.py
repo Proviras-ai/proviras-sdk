@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import urllib.error
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -87,21 +88,33 @@ class ProvirasTracer(BaseTracer):
         self._session_attempted = True
         try:
             agent_id = self._sdk.register()
-            self._sdk.request(
-                "POST",
-                "/agent/session",
-                {
-                    "sessionId": self.session_id,
-                    "agentId": agent_id,
-                    "taskDescription": self._task_description,
-                    "startedAt": _iso(self._started_at),
-                    "surface": self._surface,
-                },
-                {"X-Agent-ID": agent_id},
-            )
+            try:
+                self._post_session(agent_id)
+            except urllib.error.HTTPError as e:
+                # request() already cleared the cache on 404/410. Re-register
+                # to mint a fresh agent and retry the session create once.
+                if e.code in (404, 410) and self._sdk.agent_id is None:
+                    agent_id = self._sdk.register()
+                    self._post_session(agent_id)
+                else:
+                    raise
         except Exception:
             # Never break the graph because telemetry failed.
             pass
+
+    def _post_session(self, agent_id: str) -> None:
+        self._sdk.request(
+            "POST",
+            "/agent/session",
+            {
+                "sessionId": self.session_id,
+                "agentId": agent_id,
+                "taskDescription": self._task_description,
+                "startedAt": _iso(self._started_at),
+                "surface": self._surface,
+            },
+            {"X-Agent-ID": agent_id},
+        )
 
     def _persist_run(self, run: Run) -> None:
         self._ensure_session()

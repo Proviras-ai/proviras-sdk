@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -9,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
     from ._tracer import ProvirasTracer
+
+logger = logging.getLogger("proviras_sdk")
 
 Surface = Literal["cowork", "chat", "code", "api"]
 
@@ -70,6 +73,24 @@ class ProvirasSdk:
         self._save_config({"agentId": agent_id})
         return agent_id
 
+    def clear_cached_agent_id(self) -> None:
+        """Wipe the cached agent ID from disk and memory so the next call to
+        register() fetches a fresh one from the backend."""
+        self._agent_id = None
+        try:
+            if self._config_path.exists():
+                try:
+                    data = json.loads(self._config_path.read_text())
+                except json.JSONDecodeError:
+                    data = {}
+                data.pop("agentId", None)
+                if data:
+                    self._config_path.write_text(json.dumps(data, indent=2))
+                else:
+                    self._config_path.unlink()
+        except OSError as e:
+            logger.warning("Failed to clear cached Proviras agent ID: %s", e)
+
     def trace(
         self,
         task_description: str,
@@ -93,17 +114,28 @@ class ProvirasSdk:
         headers: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         body = json.dumps(payload, default=str).encode("utf-8")
+        merged_headers = {"Content-Type": "application/json", **(headers or {})}
         req = urllib.request.Request(
             url=f"{self.BASE_URL}{endpoint}",
             data=body,
             method=method,
-            headers={"Content-Type": "application/json", **(headers or {})},
+            headers=merged_headers,
         )
         try:
             with urllib.request.urlopen(req) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"HTTP {e.code}") from e
+            # 404/410 on an agent-scoped request means the cached agent was
+            # deleted server-side (account wipe, DB reset, etc.). Drop the
+            # local cache so the next register() creates a fresh agent.
+            if e.code in (404, 410) and "X-Agent-ID" in merged_headers:
+                logger.warning(
+                    "Proviras returned %s for cached agent %s; clearing cache.",
+                    e.code,
+                    merged_headers["X-Agent-ID"],
+                )
+                self.clear_cached_agent_id()
+            raise
         return json.loads(raw) if raw else {}
 
     def _read_agent_name(self) -> str:
@@ -117,5 +149,13 @@ class ProvirasSdk:
         return "unnamed-agent"
 
     def _save_config(self, data: dict[str, Any]) -> None:
+        """Merge new data into existing config rather than overwriting."""
         self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        self._config_path.write_text(json.dumps(data, indent=2))
+        existing: dict[str, Any] = {}
+        if self._config_path.exists():
+            try:
+                existing = json.loads(self._config_path.read_text())
+            except json.JSONDecodeError:
+                existing = {}
+        existing.update(data)
+        self._config_path.write_text(json.dumps(existing, indent=2))

@@ -6,6 +6,15 @@ import { BaseTracer, type Run } from "@langchain/core/tracers/base";
 
 export type Surface = "cowork" | "chat" | "code" | "api";
 
+export class ProvirasHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ProvirasHttpError";
+    this.status = status;
+  }
+}
+
 export interface ProvirasTracerOptions {
   sdk: ProvirasSdk;
   taskDescription: string;
@@ -75,7 +84,26 @@ export class ProvirasTracer extends BaseTracer {
   }
 
   private async createSession(): Promise<void> {
-    const agentId = await this.sdk.register();
+    let agentId = await this.sdk.register();
+    try {
+      await this.postSession(agentId);
+    } catch (err) {
+      // request() already cleared the cache on 404/410. Re-register to mint a
+      // fresh agent and retry the session create once.
+      if (
+        err instanceof ProvirasHttpError &&
+        (err.status === 404 || err.status === 410) &&
+        this.sdk.agentId === undefined
+      ) {
+        agentId = await this.sdk.register();
+        await this.postSession(agentId);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  private async postSession(agentId: string): Promise<void> {
     await this.sdk.request(
       "POST",
       "/agent/session",
@@ -458,13 +486,49 @@ export class ProvirasSdk {
     payload: unknown,
     headers?: Record<string, string>,
   ): Promise<Record<string, unknown>> {
+    const mergedHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...headers,
+    };
     const response = await fetch(`${ProvirasSdk.BASE_URL}${endpoint}`, {
       method,
-      headers: { "Content-Type": "application/json", ...headers },
+      headers: mergedHeaders,
       body: JSON.stringify(payload),
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      // 404/410 on an agent-scoped request means the cached agent was deleted
+      // server-side (account wipe, DB reset, etc.). Drop the local cache so the
+      // next register() creates a fresh agent.
+      if (
+        (response.status === 404 || response.status === 410) &&
+        mergedHeaders["X-Agent-ID"]
+      ) {
+        this.clearCachedAgentId();
+      }
+      throw new ProvirasHttpError(response.status, `HTTP ${response.status}`);
+    }
     return (await response.json()) as Record<string, unknown>;
+  }
+
+  clearCachedAgentId(): void {
+    this._agentId = undefined;
+    try {
+      if (!fs.existsSync(this.configPath)) return;
+      let data: Record<string, unknown> = {};
+      try {
+        data = JSON.parse(fs.readFileSync(this.configPath, "utf8"));
+      } catch {
+        data = {};
+      }
+      delete data.agentId;
+      if (Object.keys(data).length > 0) {
+        fs.writeFileSync(this.configPath, JSON.stringify(data, null, 2));
+      } else {
+        fs.unlinkSync(this.configPath);
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   private readAgentName(): string {
