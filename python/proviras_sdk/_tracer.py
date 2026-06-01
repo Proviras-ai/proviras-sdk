@@ -168,6 +168,7 @@ class ProvirasTracer(BaseTracer):
             llm_call = self._build_llm_call(run)
             if llm_call:
                 payload["llmCall"] = llm_call
+                payload["llm"] = llm_call
 
         try:
             agent_id = self._sdk.agent_id
