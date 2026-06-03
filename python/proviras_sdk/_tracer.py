@@ -382,19 +382,58 @@ class ProvirasTracer(BaseTracer):
         first = gens[0]
         if isinstance(first, list) and first:
             first = first[0]
-        if not isinstance(first, dict):
+        if first is None:
             return None
-        message = first.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            tool_calls = message.get("tool_calls")
-            if tool_calls:
-                return {"content": content, "toolCalls": tool_calls}
-            return content
-        text = first.get("text")
-        if isinstance(text, str):
+
+        raw_message = _read(first, "message")
+        if raw_message is not None:
+            # Unwrap lc-serialized form: {"lc": 1, "type": "constructor",
+            # "kwargs": {"content": ..., "tool_calls": ..., ...}}
+            m: Any = raw_message
+            if isinstance(raw_message, dict):
+                if (
+                    isinstance(raw_message.get("lc"), int)
+                    and raw_message.get("type") == "constructor"
+                    and isinstance(raw_message.get("kwargs"), dict)
+                ):
+                    m = raw_message["kwargs"]
+
+            content = _read(m, "content")
+            tool_calls = _read(m, "tool_calls")
+
+            # Non-empty structured content list already carries text + tool_use blocks.
+            if isinstance(content, list) and content:
+                return content
+
+            # Non-empty text + tool_calls — return both.
+            if isinstance(content, str) and content:
+                if isinstance(tool_calls, list) and tool_calls:
+                    return {"content": content, "toolCalls": tool_calls}
+                return content
+
+            # Tool-only response (content is None/""/empty list): synthesize
+            # tool_use content blocks from tool_calls so we don't lose the output.
+            if isinstance(tool_calls, list) and tool_calls:
+                blocks: list[dict[str, Any]] = []
+                for tc in tool_calls:
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": _read(tc, "id") or _read(tc, "tool_call_id"),
+                            "name": _read(tc, "name"),
+                            "input": _read(tc, "args")
+                            or _read(tc, "input")
+                            or _read(tc, "arguments"),
+                        }
+                    )
+                return blocks
+
+            return None
+
+        text = _read(first, "text")
+        if isinstance(text, str) and text:
             return text
-        return first
+        return None
 
     @staticmethod
     def _extract_stop_reason(outputs: dict[str, Any]) -> Optional[str]:
@@ -448,6 +487,16 @@ def _serialize_message(msg: Any) -> dict[str, Any]:
 
 def _normalize_role(t: str) -> str:
     return {"human": "user", "ai": "assistant"}.get(t, t)
+
+
+def _read(obj: Any, key: str) -> Any:
+    """Read ``key`` from ``obj``, whether it's a dict, a pydantic BaseMessage,
+    or any other object with that attribute."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
 
 
 def _iso(dt: datetime) -> str:

@@ -360,15 +360,51 @@ export class ProvirasTracer extends BaseTracer {
       | Record<string, unknown>
       | undefined;
     if (!first) return undefined;
-    const message = first.message as Record<string, unknown> | undefined;
-    if (message) {
-      const content = message.content;
-      const toolCalls = message.tool_calls;
-      if (toolCalls) return { content, toolCalls };
-      return content;
+
+    const rawMessage = first.message as Record<string, unknown> | undefined;
+    if (rawMessage) {
+      // Unwrap lc-serialized form: {lc, type:"constructor", kwargs:{content, tool_calls, ...}}
+      const m =
+        typeof rawMessage.lc === "number" &&
+        rawMessage.type === "constructor" &&
+        rawMessage.kwargs &&
+        typeof rawMessage.kwargs === "object"
+          ? (rawMessage.kwargs as Record<string, unknown>)
+          : rawMessage;
+
+      const content = m.content;
+      const toolCalls = m.tool_calls;
+
+      // Non-empty structured content array already carries text + tool_use blocks.
+      if (Array.isArray(content) && content.length > 0) return content;
+
+      // Non-empty text + tool_calls — return both so downstream can show them.
+      if (typeof content === "string" && content.length > 0) {
+        if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+          return { content, toolCalls };
+        }
+        return content;
+      }
+
+      // Tool-only response (content is null/""/empty array): synthesize
+      // tool_use content blocks from tool_calls so we don't lose the output.
+      if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+        return toolCalls.map((tc) => {
+          const t = tc as Record<string, unknown>;
+          return {
+            type: "tool_use",
+            id: t.id ?? t.tool_call_id,
+            name: t.name,
+            input: t.args ?? t.input ?? t.arguments,
+          };
+        });
+      }
+
+      return null;
     }
-    if (typeof first.text === "string") return first.text;
-    return first;
+
+    if (typeof first.text === "string" && first.text.length > 0) return first.text;
+    return null;
   }
 
   private extractStopReason(outputs: Record<string, unknown>): string | undefined {
